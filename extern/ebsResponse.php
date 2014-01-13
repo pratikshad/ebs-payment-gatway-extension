@@ -1,0 +1,243 @@
+<?php
+require_once 'CRM/Core/Payment/BaseIPN.php';
+require_once 'Rc43.php';
+
+class CRM_Core_Payment_EbsResponse extends CRM_Core_Payment_BaseIPN {
+
+  static private $_singleton = null;
+  static protected $_mode = null;
+  static function retrieve($name, $type, $object, $abort = true) {
+    $value = CRM_Utils_Array::value($name, $object);
+    if ($abort && $value === null) {
+      CRM_Core_Error::debug_log_message("Could not find an entry for $name");
+      echo "Failure: Missing Parameter {$name}<p>";
+      exit();
+    }
+      
+    if ($value) {
+      if (!CRM_Utils_Type::validate($value, $type)) {
+        CRM_Core_Error::debug_log_message("Could not find a valid entry for $name");
+        echo "Failure: Invalid Parameter<p>";
+        exit();
+      }
+    }
+    return $value;
+  }
+
+  function newOrderNotify($status, $privateData, $component, $amount, $transactionReference) {
+    $ids = $input = $params = array();
+    $input['component'] = strtolower($component);
+
+    $ids['contact'] = self::retrieve('contactID', 'Integer', $privateData, true);
+    $ids['contribution'] = self::retrieve('contributionID', 'Integer', $privateData, true);
+
+    if ( $input['component'] == "event" ) {
+      $ids['event'] = self::retrieve('eventID', 'Integer', $privateData, true);
+      $ids['participant'] = self::retrieve('participantID', 'Integer', $privateData, true);
+      $ids['membership']  = null;
+    } else {
+      $ids['membership'] = self::retrieve('membershipID', 'Integer', $privateData, false);
+      $ids['related_contact'] = self::retrieve('relatedContactID', 'Integer', $privateData, false);
+      $ids['onbehalf_dupe_alert'] = self::retrieve('onBehalfDupeAlert', 'Integer', $privateData, false);
+    }
+    $ids['contributionRecur'] = $ids['contributionPage'] = null;
+
+    // unset ids with value null in order to let validateData succeed
+    foreach($ids as $key => $value) {
+      if ($value == null) {
+        unset($ids[$key]);
+      }
+    }
+    
+    if (!$this->validateData($input, $ids, $objects)) {
+      CRM_Core_Error::debug_log_message("New order data not valid");
+      echo "Failure: new order data not valid<p>";
+      return false;
+    }
+
+    $input['newInvoice'] = $transactionReference;
+    $contribution =& $objects['contribution'];
+    $input['trxn_id'] =	$transactionReference;
+
+    // lets replace invoice_id with EBS TransactionID (transaction reference).
+    $contribution->invoice_id = $input['newInvoice'];
+    $input['amount'] = $amount;
+    
+    if ( $contribution->total_amount != $input['amount'] ) {
+      CRM_Core_Error::debug_log_message( "Amount values dont match between database and IPN request" );
+      echo "Failure: Amount values dont match between database and Response request. ".$contribution->total_amount."/".$input['amount']."<p>";
+      return;
+    }
+    
+    require_once 'CRM/Core/Transaction.php';
+    $transaction = new CRM_Core_Transaction( );
+
+    // check if contribution is already completed, if so we ignore this ipn
+    if ( $contribution->contribution_status_id == 1 ) {
+      CRM_Core_Error::debug_log_message( "Returning since contribution has already been handled" );
+      echo "Success: Contribution has already been handled<p>";
+      return true;
+    } 
+
+	//CRM_Core_Error::debug_var('c', $contribution);
+    $contribution->save();
+    
+    if($status=='0'){
+    	$this->completeTransaction($input, $ids, $objects, $transaction);    	
+    }
+    else{
+    	return $this->failed($objects, $transaction);
+    }
+  }
+
+  static function &singleton($mode, $component, &$paymentProcessor) {
+    if (self::$_singleton === null) {
+      self::$_singleton = new CRM_Core_Payment_EbsResponse($mode, $paymentProcessor);
+    }
+    return self::$_singleton;
+  }
+
+  static function getContext($privateData)	{
+    require_once 'CRM/Contribute/DAO/Contribution.php';
+
+    $component = null;
+    $isTest = null;
+
+    $contributionID = $privateData['contributionID'];
+    $contribution = new CRM_Contribute_DAO_Contribution();
+    // print_r($contribution);exit;
+    $contribution->id = $contributionID;
+
+    if (!$contribution->find(true)) {
+      CRM_Core_Error::debug_log_message("Could not find contribution record: $contributionID");
+      echo "Failure: Could not find contribution record for $contributionID<p>";
+      exit();
+    }
+
+    if (stristr($contribution->source, 'Online Contribution')) {
+      $component = 'contribute';
+    }
+    elseif (stristr($contribution->source, 'Online Event Registration')) {
+      $component = 'event';
+    }
+    $isTest = $contribution->is_test;
+
+    $duplicateTransaction = 0;
+    if ($contribution->contribution_status_id == 1) {
+      //contribution already handled. (some processors do two notifications so this could be valid)
+      $duplicateTransaction = 1;
+    }
+
+    if ($component == 'contribute') {
+      if (!$contribution->contribution_page_id) {
+        CRM_Core_Error::debug_log_message("Could not find contribution page for contribution record: $contributionID");
+        echo "Failure: Could not find contribution page for contribution record: $contributionID<p>";
+        exit();
+      }
+
+      // get the payment processor id from contribution page
+         $paymentProcessorID = CRM_Core_DAO::getFieldValue('CRM_Contribute_DAO_ContributionPage', $contribution->contribution_page_id, 'payment_processor');
+      // print_r($paymentProcessorID);exit;
+    }
+    else {
+      $eventID = $privateData['eventID'];
+
+      if (!$eventID) {
+        CRM_Core_Error::debug_log_message("Could not find event ID");
+        echo "Failure: Could not find eventID<p>";
+        exit();
+      }
+
+      // we are in 
+      // make sure event exists and is valid
+      require_once 'CRM/Event/DAO/Event.php';
+      $event = new CRM_Event_DAO_Event();
+      //print_r($event);exit;
+      $event->id = $eventID;
+      if (!$event->find(true)) {
+        CRM_Core_Error::debug_log_message("Could not find event: $eventID");
+        echo "Failure: Could not find event: $eventID<p>";
+        exit();
+      }
+
+      // get the payment processor id from contribution page
+      // $paymentProcessorID = CRM_Core_DAO::getFieldValue('CRM_Event_DAO_Event', $eventID, 'payment_processor');
+       $paymentProcessorID = $eventID;
+      // $paymentProcessorID = $event->payment_processor;
+      // $paymentProcessorID = 8;
+      
+    }
+
+    if (!$paymentProcessorID) {
+      CRM_Core_Error::debug_log_message("Could not find payment processor for contribution record: $contributionID");
+      echo "Failure: Could not find payment processor for contribution record: $contributionID<p>";
+      exit();
+    }   
+
+    return array($isTest, $component, $paymentProcessorID, $duplicateTransaction);
+  }
+
+
+  static function main($qfKey) {
+    require_once 'CRM/Utils/Request.php';
+    $config = CRM_Core_Config::singleton();    
+    
+    $privateData['contactID'] = (isset($_GET['contactID'])) ? $_GET['contactID'] : '';
+    $privateData['contributionID'] = (isset($_GET['contributionID'])) ? $_GET['contributionID'] : '';
+    $privateData['contributionTypeID'] = (isset($_GET['contributionTypeID'])) ? $_GET['contributionTypeID'] : '';    
+    $privateData['eventID'] = (isset($_GET['eventID'])) ? $_GET['eventID'] : '';
+    $privateData['participantID'] = (isset($_GET['participantID'])) ? $_GET['participantID'] : '';
+    $privateData['membershipID'] = (isset($_GET['membershipID'])) ? $_GET['membershipID'] : '';
+    $privateData['relatedContactID'] = (isset($_GET['relatedContactID'])) ? $_GET['relatedContactID'] : '';
+    $privateData['onBehalfDupeAlert'] = (isset($_GET['onBehalfDupeAlert'])) ? $_GET['onBehalfDupeAlert'] : '';    
+    
+    list($mode, $component, $paymentProcessorID, $duplicateTransaction) = self::getContext($privateData);   
+    echo $mode;
+    $mode = $mode ? 'test' : 'live';   
+     
+    $paymentProcessorID2 = CRM_Core_DAO::getFieldValue('CRM_Financial_DAO_PaymentProcessor','EBS', 'id', 'name');  
+    require_once 'CRM/Financial/BAO/PaymentProcessor.php';
+    print_r($paymentProcessorID2);print_r($mode);
+    $paymentProcessor = CRM_Financial_BAO_PaymentProcessor::getPayment($paymentProcessorID2, $mode);     
+    
+    $secret_key = $paymentProcessor['password'];
+    $DR = (isset($_GET['DR'])) ? $_GET['DR'] : '';
+    if(isset($DR)){
+	    $DR = preg_replace("/\s/","+",$DR);
+	    $rc4 = new Crypt_RC4($secret_key);
+	    $QueryString = base64_decode($DR);
+	    $rc4->decrypt($QueryString);
+	    $QueryString = explode('&',$QueryString);
+	    $ebsResponse = array();
+	    foreach($QueryString as $param){
+		    $param = explode('=',$param);
+		    $ebsResponse[$param[0]] = urldecode($param[1]);
+	    }
+    }      
+           
+    if ($duplicateTransaction == 0) {
+      $ipn=& self::singleton($mode, $component, $paymentProcessor);
+      $ipn->newOrderNotify($ebsResponse['ResponseCode'], $privateData, $component, $ebsResponse['Amount'], $ebsResponse['TransactionID']);
+    }
+    if ($ebsResponse['ResponseCode'] == '0') {
+	    if ($component == "event") {
+	    	$finalURL = CRM_Utils_System::url('civicrm/event/register', "_qf_ThankYou_display=1&qfKey={$qfKey}", TRUE, null, false);
+	    }
+	    elseif ($component == "contribute") {
+	   		$finalURL = CRM_Utils_System::url('civicrm/contribute/transact', "_qf_ThankYou_display=1&qfKey={$qfKey}", TRUE, null, false);
+	    }
+    }
+    else {
+    	CRM_Core_Error::debug_log_message("Payment is Failed");
+	    if ($component == "event") {
+	    	$finalURL = CRM_Utils_System::url('civicrm/event/confirm', "reset=1&cc=fail&participantId={$privateData['participantID']}", TRUE, null, false);
+	    }
+	    elseif ($component == "contribute") {
+	    	$finalURL = CRM_Utils_System::url('civicrm/contribute/transact', "_qf_Main_display=1&cancel=1&qfKey={$qfKey}", TRUE, null, false);
+	    	
+	    }
+    }
+    CRM_Utils_System::redirect( $finalURL );
+  }
+  
+}
